@@ -142,10 +142,17 @@ url = "http://127.0.0.1:8790"
     SIMD_COORD_ADDR: COORD_ADDR,
     SIMD_COORD_TOKEN: COORD_TOKEN,
     SIMD_FLEET: fleetPath,
-    SIMD_POLL_SECS: "1",
+    // CI runners are slow: a real sim boot + app download runs for minutes and
+    // pegs the box. Give the coordinator→worker forward a long deadline, and
+    // make health polls tolerant of a briefly-unresponsive daemon — otherwise
+    // workers flap DOWN under boot load and drop out of placement / list.
+    SIMD_POLL_SECS: process.env.SIMD_POLL_SECS ?? "2",
+    SIMD_POLL_TIMEOUT_SECS: process.env.SIMD_POLL_TIMEOUT_SECS ?? "30",
+    SIMD_DOWN_AFTER: process.env.SIMD_DOWN_AFTER ?? "5",
+    SIMD_RPC_TIMEOUT_SECS: process.env.SIMD_RPC_TIMEOUT_SECS ?? "600",
   });
   await waitHealthy(COORD_URL, "coordinator");
-  await sleep(2500); // a couple of polls so w1/w2 are proven up
+  await sleep(8000); // a few 2s polls so w1/w2 flip from start-down to up
 
   log("fleet: w1+w2 up, ghost down");
   const fleet = (await (

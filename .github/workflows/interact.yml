@@ -1,0 +1,137 @@
+# Remote-drive proof: run the coordinator + workers on a GitHub macOS runner,
+# expose the coordinator through a cloudflared quick tunnel (the job dials OUT —
+# nothing connects in), and let a client on your own machine drive it.
+#
+# The initial sim boot + Expo Go install is slow (minutes) and would blow past
+# Cloudflare's ~100s edge timeout, so it runs server-side here as a "warm-up"
+# create keyed with an idempotency key. The connection info (tunnel URL, token,
+# device/runtime, key) is published as an artifact you can download WHILE the
+# job is still running. The local client then replays that key (instant) and
+# drives the fast verbs — relaunch + screenshot — over the tunnel.
+name: interact
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: how long to keep the fleet reachable
+        default: "15"
+
+env:
+  COORD_TOKEN: interact-coord-token
+  W1_TOKEN: interact-w1-token
+  APP_URL: https://github.com/expo/expo-go-releases/releases/download/Expo-Go-57.0.2/Expo-Go-57.0.2.tar.gz
+  WARMUP_KEY: interact-warmup
+  SIMD_ACCEPT_LOAD_PCT: "10000"
+
+jobs:
+  remote-fleet:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Prepare binaries + cloudflared
+        run: |
+          chmod +x bin/simulatord bin/simd-coordinator
+          xattr -dr com.apple.quarantine bin || true
+          brew install cloudflared
+          cloudflared --version
+
+      - name: Pick an available simulator runtime + device type
+        run: |
+          set -euo pipefail
+          RUNTIMES=$(xcrun simctl list runtimes -j)
+          RUNTIME=$(echo "$RUNTIMES" | jq -r '
+            [.runtimes[] | select(.platform=="iOS" and .isAvailable)]
+            | sort_by(.version | split(".") | map(tonumber)) | last.identifier')
+          [ -n "$RUNTIME" ] && [ "$RUNTIME" != "null" ] || { echo "no iOS runtime"; exit 1; }
+          DEVTYPE=$(echo "$RUNTIMES" | jq -r --arg rt "$RUNTIME" '
+            ([.runtimes[] | select(.identifier==$rt)][0].supportedDeviceTypes // [])
+            | [.[].name | select(startswith("iPhone"))]
+            | (map(select(test("Pro$"))) | last) // last // empty')
+          [ -n "$DEVTYPE" ] && [ "$DEVTYPE" != "null" ] || { echo "no iPhone device"; exit 1; }
+          echo "SIMD_RUNTIME=$RUNTIME"     >> "$GITHUB_ENV"
+          echo "SIMD_DEVICE_TYPE=$DEVTYPE" >> "$GITHUB_ENV"
+          echo "picked runtime=$RUNTIME device=$DEVTYPE"
+
+      - name: Bring up fleet + tunnel, warm up the session, write connection info
+        run: |
+          set -euo pipefail
+          mkdir -p out conn
+
+          # fleet config (two workers; coordinator fronts them)
+          cat > out/fleet.toml <<EOF
+          [[worker]]
+          label = "w1"
+          url = "http://127.0.0.1:8711"
+          token = "$W1_TOKEN"
+
+          [[worker]]
+          label = "w2"
+          url = "http://127.0.0.1:8712"
+          EOF
+
+          # workers + coordinator, backgrounded so they outlive this step
+          SIMD_ADDR=127.0.0.1:8711 SIMD_TOKEN=$W1_TOKEN SIMD_LABEL=w1 SIMD_STATE=out/w1-state.json \
+            nohup bin/simulatord > out/w1.log 2>&1 & disown
+          SIMD_ADDR=127.0.0.1:8712 SIMD_LABEL=w2 SIMD_STATE=out/w2-state.json \
+            nohup bin/simulatord > out/w2.log 2>&1 & disown
+          SIMD_COORD_ADDR=127.0.0.1:8700 SIMD_COORD_TOKEN=$COORD_TOKEN SIMD_FLEET=out/fleet.toml \
+            SIMD_POLL_SECS=2 SIMD_POLL_TIMEOUT_SECS=30 SIMD_DOWN_AFTER=5 SIMD_RPC_TIMEOUT_SECS=600 \
+            nohup bin/simd-coordinator > out/coordinator.log 2>&1 & disown
+
+          echo "waiting for coordinator health..."
+          for i in $(seq 1 80); do
+            if curl -sf http://127.0.0.1:8700/health >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          [ "${ok:-}" = 1 ] || { echo "coordinator never healthy"; cat out/coordinator.log; exit 1; }
+          sleep 8   # a few polls so w1/w2 flip up
+
+          echo "starting cloudflared quick tunnel..."
+          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8700 > out/cf.log 2>&1 & disown
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' out/cf.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          [ -n "$URL" ] || { echo "no tunnel url"; cat out/cf.log; exit 1; }
+          echo "tunnel URL: $URL"
+
+          echo "warm-up create (server-side, boots the sim + installs Expo Go)..."
+          BODY=$(jq -nc --arg dt "$SIMD_DEVICE_TYPE" --arg rt "$SIMD_RUNTIME" --arg app "$APP_URL" --arg key "$WARMUP_KEY" \
+            '{method:"create",params:{name:"interact",device_type:$dt,runtime:$rt,app:$app,hibernate_secs:null,cool_secs:null,purge_secs:null,idempotency_key:$key}}')
+          curl -s --max-time 590 -X POST http://127.0.0.1:8700/v1/rpc \
+            -H "authorization: Bearer $COORD_TOKEN" -H 'content-type: application/json' \
+            -d "$BODY" > out/warmup.json
+          echo "warm-up result: $(cat out/warmup.json)"
+          jq -e '.status=="created"' out/warmup.json >/dev/null || { echo "warm-up create failed"; exit 1; }
+
+          jq -nc --arg url "$URL" --arg token "$COORD_TOKEN" --arg dt "$SIMD_DEVICE_TYPE" \
+            --arg rt "$SIMD_RUNTIME" --arg app "$APP_URL" --arg key "$WARMUP_KEY" \
+            '{url:$url,token:$token,device_type:$dt,runtime:$rt,app:$app,key:$key}' > conn/conn.json
+          echo "connection info: $(cat conn/conn.json)"
+
+      - name: Publish connection info (downloadable while the job runs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: conn
+          path: conn/conn.json
+
+      - name: Keep the fleet reachable
+        run: |
+          MINS="${{ inputs.hold_minutes }}"
+          echo "holding fleet open for ${MINS} minute(s); cancel the run when your client is done"
+          sleep $(( MINS * 60 ))
+
+      - name: Upload fleet logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-logs
+          path: out/

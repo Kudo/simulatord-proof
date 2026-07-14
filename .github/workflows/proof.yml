@@ -1,0 +1,61 @@
+# Proof-of-life for the simulatord cluster, from prebuilt binaries only — no
+# Rust source in this repo. One ephemeral macOS runner boots the whole fleet
+# (coordinator + two workers) on localhost and drives it through the client.
+# Nothing connects in from outside; there is no tunnel. Screenshots + daemon
+# logs are uploaded as proof artifacts.
+name: proof
+
+on:
+  workflow_dispatch: {}   # run on demand from the Actions tab
+
+jobs:
+  cluster-proof:
+    # arm64 macOS with Xcode + iOS simulators. The prebuilt binaries are arm64,
+    # minos 13.0, ad-hoc signed — so they run here as-is.
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      # A few-core runner spikes load while a sim boots; without this the shared
+      # host-load floor can flip both co-located workers to not-accepting and
+      # flake placement. cluster.ts spreads process.env into the workers.
+      SIMD_ACCEPT_LOAD_PCT: "10000"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Make binaries runnable
+        # git preserves the exec bit and applies no quarantine, but be explicit.
+        run: |
+          chmod +x bin/simulatord bin/simd-coordinator
+          xattr -dr com.apple.quarantine bin || true
+          file bin/*
+
+      - name: Pick an available simulator runtime + device type
+        # The client can't send a runtime the runner doesn't have, so discover
+        # the newest available iOS runtime and iPhone device type on this image.
+        run: |
+          set -euo pipefail
+          RUNTIME=$(xcrun simctl list runtimes -j \
+            | jq -r '[.runtimes[] | select(.platform=="iOS" and .isAvailable)]
+                     | sort_by(.version | split(".") | map(tonumber)) | last.identifier')
+          DEVTYPE=$(xcrun simctl list devicetypes -j \
+            | jq -r '[.devicetypes[] | select(.productFamily=="iPhone")] | last.name')
+          if [ -z "$RUNTIME" ] || [ "$RUNTIME" = "null" ]; then
+            echo "no available iOS runtime on this runner"; xcrun simctl list runtimes; exit 1
+          fi
+          echo "SIMD_RUNTIME=$RUNTIME"     >> "$GITHUB_ENV"
+          echo "SIMD_DEVICE_TYPE=$DEVTYPE" >> "$GITHUB_ENV"
+          echo "picked runtime=$RUNTIME device=$DEVTYPE"
+
+      - name: Run cluster proof
+        run: bun cluster.ts
+
+      - name: Upload proof (screenshot + daemon logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-proof
+          path: out/
+          if-no-files-found: warn

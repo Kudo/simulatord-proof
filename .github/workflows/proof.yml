@@ -33,17 +33,25 @@ jobs:
           file bin/*
 
       - name: Pick an available simulator runtime + device type
-        # The client can't send a runtime the runner doesn't have, so discover
-        # the newest available iOS runtime and iPhone device type on this image.
+        # The client can't send a runtime/device the runner doesn't have. Pick
+        # the newest available iOS runtime, then a device type FROM THAT
+        # runtime's supportedDeviceTypes (compatibility guaranteed) — iPhone
+        # only (simctl files iPod touch under productFamily "iPhone"), Pro first.
         run: |
           set -euo pipefail
-          RUNTIME=$(xcrun simctl list runtimes -j \
-            | jq -r '[.runtimes[] | select(.platform=="iOS" and .isAvailable)]
-                     | sort_by(.version | split(".") | map(tonumber)) | last.identifier')
-          DEVTYPE=$(xcrun simctl list devicetypes -j \
-            | jq -r '[.devicetypes[] | select(.productFamily=="iPhone")] | last.name')
+          RUNTIMES=$(xcrun simctl list runtimes -j)
+          RUNTIME=$(echo "$RUNTIMES" | jq -r '
+            [.runtimes[] | select(.platform=="iOS" and .isAvailable)]
+            | sort_by(.version | split(".") | map(tonumber)) | last.identifier')
           if [ -z "$RUNTIME" ] || [ "$RUNTIME" = "null" ]; then
-            echo "no available iOS runtime on this runner"; xcrun simctl list runtimes; exit 1
+            echo "no available iOS runtime on this runner"; echo "$RUNTIMES" | jq '.runtimes[].name'; exit 1
+          fi
+          DEVTYPE=$(echo "$RUNTIMES" | jq -r --arg rt "$RUNTIME" '
+            ([.runtimes[] | select(.identifier==$rt)][0].supportedDeviceTypes // [])
+            | [.[].name | select(startswith("iPhone"))]
+            | (map(select(test("Pro$"))) | last) // last // empty')
+          if [ -z "$DEVTYPE" ] || [ "$DEVTYPE" = "null" ]; then
+            echo "no compatible iPhone device type for $RUNTIME"; exit 1
           fi
           echo "SIMD_RUNTIME=$RUNTIME"     >> "$GITHUB_ENV"
           echo "SIMD_DEVICE_TYPE=$DEVTYPE" >> "$GITHUB_ENV"
